@@ -9,15 +9,12 @@
 ; graphics using the VESA standard.                                       ;
 ; It can read characters from the keyboard, translate some of them, and   ;
 ; display them on the screen.                                             ;
-; It can run display output using paging or not.                          ;
-; It can also allow breakpoints to be entered using the int 3 instruction.;
-; Finally, it attempts to read the first sector from a floppy drive.      ;
-; Unfortunately, this does not work, as I could not find out how to set   ;
-; the input buffer address for the DMA controller, while in proteced mode.;
-; Therefore, the call to readSector has been commented out to prevent a   ;
-; system crash.                                                           ;
-; If anyone reading this knows how this may be accomplished, please       ;
-; contact me at my email address given above.                             ;
+; It can allow breakpoints to be entered using the int3 instruction.      ;
+; It can allow the user to set a timer using interrupts.                  ;
+; Finally, it reads the 1st sector of the 1st cylinder (The Boot Sector)  ;
+; on a floppy diskette in drive A:.                                       ;
+; with DMA mode turned off, thereby sidestepping the need for a buffer    ;
+; address.  Then is displays the first four bytes of that sector.         ;
 ;                                                                         ;
 ; Many thanks to David Lindaur, who created the original program in 1995  ;
 ; that this program has built on.  The original program displayed text on ;
@@ -26,20 +23,14 @@
 ;                                                                         ;
 ; This program may be built using TASM.  It may be debugged using int 3   ;
 ; instructions and displaying memory or by using the displayDebugInfo     ;
-; function defined in this program.                                       ; 
+; function defined in this program.                                       ;
 ;                                                                         ;
-; To Switch between text mode and grahics mode, code blocks A and B need  ;
-; to be switched, as well as blocks E and F.  Don't forget about the LFB  ;
-; address and the 512th entry in the page table if paging is enabled.     ;
-; To Switch between paging and non-paging, switch blocks C and D.         ;
-; By switching, I mean comment/uncomment of the lines in the block.       ;                                                                        ;
 ; Important notes:                                                        ;
 ; (1) For the graphics to work, the correct Linear Frame Buffer address   ;
 ;     must be found for your video card.                                  ;
 ;     On my DOS machine, the Linear Frame Buffer Address happens to be    ;
-;     0e8000000h, which was discovered using the bios call int 10h,       ; 
-;     function 4f01h.                                                     ;
-; (2) SoftIce cannot be used to debug this program, as far as I can tell. ;
+;     0e8000000h, which was discovered using the bios call int 10h,       ;;     function 4f01h.                                                     ;
+; (2) SoftIce cannot be used to debug this program, as far as I can tell. ;;                                                                         ;
 ; The following commands in a batch file were used to build this program. ;
 ;  tasm /zi /l w.asm, w.obj                                               ;
 ;  tlink /3 /v /m w.obj, w.exe                                            ;
@@ -103,6 +94,8 @@ ABSDATA ENDS
 tos LABEL BYTE
 
 SEG386  SEGMENT
+buffer   db  'ABC'
+         db  509 DUP('A')
 tGDT  db  8 DUP(-1)   ;protected mode GET
       db  GDTSIZE-8 DUP(0)
 
@@ -120,8 +113,6 @@ ridt    dw  03ffh
 
 zero    dd  0   ;Offset of Protected mode from absolute zero
 
-;buffer  db  'ABC'
-;        db  509 DUP('A')
 kbuffer db 200 DUP(0) 
 keyTable db 15 DUP(0)
         db 'QWERTYUIOP'
@@ -147,10 +138,11 @@ ABSDATA SEGMENT
 
 seg8086 SEGMENT
   assume  cs:dgroup
+workarea  db  256 DUP('X')
 modeblock  db 256 DUP('C') 
 returnMsg  db 'Press <Enter> to return to DOS$'
 bootstrap:
-;-----------BLOCK A -------------------------------------------------;
+;-----------------------------------------------------------------;
 ; Either use the first block right below to set the video mode to 
 ; high resolution graphics, or the next block for text mode.
 ; First, the vesa mode information is retrieved
@@ -166,11 +158,16 @@ bootstrap:
 ;  mov   ax,4f02h ; set vesa mode
 ;  mov   bx,4105h ; bit 14 is Linear frame buffer mode
 ;  int   10h      ; It is OK to use BIOS before moving to protected mode
-;-------BLOCK B  ---------------------------------------------------;
- mov ax,0003h  ;text mode
- int 10h       ;It is OK to use BIOS before moving to protected mode 
+;-------------------------------------------------------------------;
+;mov ax,0003h  ;text mode
+;int 10h       ;It is OK to use BIOS before moving to protected mode 
 ;-------------------------------------------------------------------;
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Converts binary value in ax 
+; to ascii for display
+; and returns the result in bx
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   cld
   cli     ;Interrupts clear throughout
 
@@ -252,7 +249,6 @@ iGDT  LABEL WORD
   GDTENTRY  0,00ffffh,92h,gdtZeroOffset     ; 8086 data
   GDTENTRY  0,0fffffh,0c092h,gdtLastEntry    ; Absolute
 ; Work area to store data to be displayed at breakpoint
-buffer  db  512 DUP(5ch)
 work  db 8 DUP(42,7)
 dpt   db 16 DUP(0)   ;Diskette Parameter Table
 ProtectedMode LABEL BYTE
@@ -270,14 +266,12 @@ ProtectedMode LABEL BYTE
   mov gs,bx
   call  initpagetables
   call  initinterrupt
-;----- BLOCK C ------------------------------------------------  
 ; Turn paging on
   mov eax,offset pageDir;   set the page directory base register
   mov CR3,eax
   mov eax,CR0
   or  eax,80000000h
   mov CR0,eax
-;---------------------------------------------------------------  
   ; Here we are in protected mode, with a sensible environment
   ; set up in the selectors.
 protection:
@@ -285,14 +279,12 @@ protection:
   call  userprog
 endprotection:
   cli
-;-----  BLOCK D ------------------------------------------------  
   ;Turn paging off by resetting the page enable bit
   ;Again, physical and linear addresses must be the same for
   ;this segment of code
- mov eax,CR0
- and eax,7fffffffh
- mov CR0,eax
-;--------------------------------------------------------------- 
+  mov eax,CR0
+  and eax,7fffffffh
+  mov CR0,eax
   ;Prepare to return to real mode
   ;Reload our selectors with real mode compatible segment values.
   add esp,[zero]    ; Stack adjust
@@ -340,20 +332,14 @@ RealMode2:
 
   ; Here we are back in Real mode with our segment registers set
   ; up to something sensible.
-  mov ax,0003h
-  int 10h ; Return to text mode before returning to DOS
-
-  ;Display return to DOS message
-  mov   ah,09h
-  lea   dx,returnMsg
-  int   21h 
-
-;  mov ah,0
-;  int 16h ; wait for keypress before returning to DOS
+; mov ax,0003h
+; int 10h ; Return to text mode before returning to DOS
+  mov ah,0
+  int 16h ; wait for keypress before returning to DOS
 
   mov ah,04ch
   int 21h
-endprog:
+
 SEG8086 ENDS
 SEG386  SEGMENT
 ; Create all page tables
@@ -389,7 +375,8 @@ fill16mb:
   rep stosd
   ;
   mov edi,offset videopagetable
-  mov eax,0e8020000h-4096+7  ; Top page of the address to access
+; mov eax,0e8020000h-4096+7  ; Top page of the address to access(graphic)
+  mov eax,0c0000h-4096+7  ; Top page of the address to access(text)
   mov ecx,32
 fillvideo:
   mov [edi+ecx*4-4],eax ; Fill in the table entry
@@ -434,6 +421,15 @@ timerinterrupt  proc
   pop   ds
   iretd
 timerinterrupt  endp
+ 
+diskinterrupt proc
+  mov ax,fs
+  mov es,ax
+  sub di,di
+  mov ax,0f2ah
+  mov word ptr es:[di],ax
+  iretd
+diskinterrupt endp
 
 keyboardRtn proc
   push  es
@@ -544,6 +540,16 @@ debugRtn  endp
   mov byte ptr [edi + 4],0      ; Always 0 for interrupts
   mov byte ptr [edi + 5],08eh   ; Signifies an interrupt gate, present 
 
+; Setup IDT entry for the floppy diskette device
+;  mov edi,8 * 10 + offset tIDT     ; interrupts are 8 bytes long
+;  mov eax,offset diskinterrupt
+;  mov [edi],ax          ; Start by plopping in the code offset
+;  shr eax,16
+;  mov [edi + 6],ax      ; High 16 bits
+;  mov word ptr [edi + 2],CS386  ; Now plop in the Code segment selector
+;  mov byte ptr [edi + 4],0      ; Always 0 for interrupts
+;  mov byte ptr [edi + 5],08eh   ; Signifies an interrupt gate, present 
+
   ; setup idt entry for the breakpoint interrupt
   mov edi,8 * 3 + offset tIDT     ; interrupts are 8 bytes long
                                    ; we are hooking int 3
@@ -592,17 +598,15 @@ displayDebugInfo  proc
   push  es      ; Load the screen up with '!'
   push  fs
   push  ecx
-;  push  fs
-;  pop   es      ; Load ES with DSABS
   push  DSABS
   pop   es
-;  mov   eax,ebx       ; Get char to display
-;  mov   ebx,offset work
-  call  htoa        ; Convert hex value in ax to ascii
+  mov   ebx,offset work
+; call  htoa        ; Convert hex value in ax to ascii
   ;mov   ax,0721h    ; Black & White '!'
   ;
   ; Uncomment this line to access at the proper address
-   mov edi,0b8000h      ;Linear Frame Buffer screen address
+   mov edi,80000000h + 18000h    ; B*00 = a000 + 18000
+;  mov edi,0b8000h      ;Linear Frame Buffer screen address
   ;
   ; The next line accesses screen memory at the 80000000h page
    mov  esi,offset work ;point to work area where data to display is stored
@@ -629,9 +633,9 @@ displayDebugInfo  proc
       sti
     mov ecx,1000
 loopit2: loop loopit2
-tloop:
+tloop1:
       cmp [timer],36  ; Wait until timer has ticked 36 times (two seconds)
-      jc  tloop
+      jc  tloop1
       cli
 ;
 ; Reenable keyboard interrupts
@@ -649,12 +653,14 @@ displayDebugInfo2 proc
   push  ebx
   push  ecx
   push  edx
-  mov   dx,DSABS
+  mov   dx,fs
+; mov   dx,DSABS
   mov   es,dx
   mov   ds,dx
   mov   ebx,offset work
-  call  htoa        ; Convert hex value in ax to ascii
+; call  htoa        ; Convert hex value in ax to ascii
   mov   edi,0b8000h      ;Linear Frame Buffer screen address
+; mov edi,80000000h + 18000h    ; B*00 = a000 + 18000
   mov   esi,offset work ;point to work area where data to display is stored
   mov   ecx,4   ;Setup to display 8 bytes (4 ascii characters)
   rep   movsd
@@ -710,9 +716,6 @@ displayDisketteParmTab  proc
   push  eax
   push  ebx
 
-  mov   ax,DSABS
-  mov   es,ax
-  mov   ds,ax
   mov   esi,0f9c32h  ; Point to the diskette parameter table
 ;  mov   eax,dword ptr [0f9c32h]   ; Get dpt data
 ;  mov   eax,42424242h ; Get dpt data
@@ -725,7 +728,7 @@ displayDisketteParmTab  proc
   mov   ebx,offset dpt
   mov   al,mot_start[ebx]
   mov   ebx,offset work
-  call  htoa         ; Convert hex bytes to ascii
+; call  htoa         ; Convert hex bytes to ascii
   mov   ecx,4
   mov   edi,0b8000h  ; Screen origin
   mov   esi,offset work
@@ -751,99 +754,57 @@ userprog  proc
   ;
   push  es      ; Load the screen up with '!'
   push  fs
-;  push  DSABS
   push  fs
-  pop   es
-;---------BLOCK E  -------------------------------------------------;
-; Text mode output to the screen                                    ;
- mov ax,0721h    ; Black & White '!'
- mov ecx,80*24   ; 24x80 character text screen
- mov edi,0b8000h
- rep stosw
- jmp doneDisplay
-;---------BLOCK F --------------------------------------------------;
-; Graphics mode output to the screen                                ;
-; Uncomment this line to access at the proper address when paging is;
-; disabled.                                                         ; 
-;  mov edi,0e8000000h      ;Linear Frame Buffer screen address      ;
-;                                                                   ;
-; The next line accesses screen memory at the 80000000h page when   ;
-; paging is enabled                                                 ;
-; If you try to write more than 128 lines, the program will crash   ;
-; since paging is only set up for this amount.                      ;
-;  mov edi,80000000h   ;Access 512th entry in the page table        ;
-;  mov eax,01010101h   ;Four pixels in blue color                   ;
-;  mov ecx,1024*128/4  ;Draw 128 lines (1/6 of the full screen.     ;
-;  rep stosd           ;Draw Four bytes at a time                   ;
-;-------------------------------------------------------------------;
-doneDisplay:
-  pop fs
-  pop es
-;  mov ecx,1194000000
-;tloop9:
-;  loop  tloop9
-;  int 3 ;breakpoint
-;  sti
-tloop2:
-;  cmp [timer],72  ; Wait until timer has ticked 72 times (four seconds)
-;  jc  tloop2
-  cli
+  pop   es      ; Load ES with DDSABS
+  mov   ax,0721h    ; Black & White '!'
+  ;
+  ; The next line accesses screen memory at the 80000000h page
+  ; which is mapped to address A000, although the corresponding entry
+  ; in the page table is actually 0c0000h-4096+7
+    mov edi,80000000h + 18000h    ; B*00 = a000 + 18000
+;   mov edi,0b8000h
+    mov ecx,80*24     ; 24x80 screen
+    rep stosw
+    call  readSector
+    pop fs
+    pop es
+    ;
+    ; Enable interrupts and wait around a couple of seconds
+    ;
+    ; First, disable keyboard interrupts
+    ; This way, if a key comes in we won't crash
+    ;
+;      in  al,21h    ;PIC interrupt control port
+;      or  al,2      ; Bit to disable keyboard interrupts
+;      out 21h,al    ; Do disable (without this out instruction, it crashes
+;      sti
+;;
+;; Reenable keyboard interrupts
+;  in  al,21h    ; Read PIC interrupt port
+;  and al,0fdh   ; reenable keyboard
+;  out 21h,al    ; Do enable
+  ret
 ;
-; Enable interrupts and wait around a couple of seconds
-;
-; First, disable keyboard interrupts
-  in  al,21h    ;PIC interrupt control port
-  or  al,2      ; Bit to disable keyboard interrupts
-  out 21h,al    ; Do disable (without this out instruction, it crashes
-  sti
-tloop4:
-     cmp [timer],90  ; Wait until timer has ticked 360 times 20 seconds)
-     jc  tloop4
-  int 3
-  cli
-;
-; Reenable keyboard interrupts
-  in  al,21h    ; Read PIC interrupt port
-  and al,0fdh   ; reenable keyboard
-  out 21h,al    ; Do enable
-;  call readSector
-    sti
-  in  al,60h    ;Read keypress <Enter Key?>
-  in  al,60h    ;Read keypress <Enter Key?>
-  mov ecx,3294000000
-tloop9:
-  loop  tloop9
-ret
 userprog  endp
 
 readSector  proc
-
-  ; Getting Diskette Parameter Table pointer
-
-  ; Turning on the motor in the "A:" drive
-  ; Enabling interrupts before actual turning on
-;  _enable();   // Is this function call really necessary?
-;  outp (0x3F2, 0x1C);
-;  int 3
-  sti
-
-  mov ax,1ch
+; sti
+; Turn on the diskette motor
+; and disable the DMA
+  mov ax,14h      ;bit 3 is zero, which turns off DMA mode
   mov dx,3f2h
   out dx,ax
 
-  ;int 3
-
   ; Waiting while motor speeds up
-  mov ax,18
+  mov eax,18
   call tdelay
 
-  ;int 3
   ; recalibrate
   mov ah,7
   call  fdc_out 
   mov ah,0
   call  fdc_out 
-  call  int_wait
+; call  int_wait
 
   ;int 3
   ; We need to move drive head to the CYL track
@@ -863,10 +824,10 @@ readSector  proc
 
 
   ; Interrupt notifies us about operation end
-  call  int_wait
+; call  int_wait
 
   ; Delay for head positioning
-  mov ax,5
+  mov eax,5
   call  tdelay
 
   ; In order to check the result of the "Seek" command
@@ -891,9 +852,7 @@ readSector  proc
   mov dx,3f7h
   out dx,ax
   ; DMA initialization
-  ;int 3
-  call  dma_init 
-
+; call  dma_init 
   ; "Read Data" command
   mov ah,66h
   call  fdc_out 
@@ -904,9 +863,12 @@ readSector  proc
   call  fdc_out 
   mov ah,0
   call  fdc_out 
-  mov ah,1
+  mov ah,1    ;Read the first sector on cylinder 0
   call  fdc_out 
 
+  ; The values that would normally come from the call to getDiskParmTab
+  ; were discovered in a separate real mode application to avoid the 
+  ; unusable BIOS int 13h call.
   ; Sending some technical info to FDC.
   ; This info may be obtained form the Diskette Parameter Table.
   ; Parameters are:
@@ -914,167 +876,151 @@ readSector  proc
   ;    - last sector on a track;
   ;    - gap length;
   ;    - number of bytes to be read/write
-  call  getDiskParmTab
-  lea   ebx,dpt
-  xor al,al
-  mov ah,[ebx].sec_size
+; call  getDiskParmTab
+; lea   ebx,dpt
+; xor al,al
+; mov ah,[ebx].sec_size
+  mov ah,2h
   ;int 3
   call  fdc_out 
-  mov ah,[ebx].eot
+; mov ah,[ebx].eot
+  mov ah,12h
   ;int 3
   call  fdc_out 
-  mov ah,[ebx].gap_rw
+; mov ah,[ebx].gap_rw
+  mov ah,1bh
   ;int 3
   call  fdc_out 
-  mov ah,[ebx].dtl
+; mov ah,[ebx].dtl
+  mov ah,0ffh
   ;int 3
   call  fdc_out 
 
   ; Waiting for interrupt (end of operation)
-  call  int_wait
-
+; call  int_wait
+  mov   dx,3F4h
+  call  fdc_inp
+  mov   ax,fs
+  mov   es,ax
+  mov   edi,0b8000h
+; mov edi,80000000h + 18000h    ; B*00 = a000 + 18000
+  mov   ah,0fh
+  mov   cx,4
+readNext:
+  push  cx
+  mov   dx,3f5h
+  in    al,dx
+; mov   al,2ah
+  mov   word ptr es:[edi],ax
+  add   edi,2
+  pop   cx
+  loop  readNext
+  mov   ecx,500000000
+waitLoop:
+  loop  waitLoop
+; Read one byte of data from the Data Register
+; call  fdc_inp
+; mov   ax,1111h
+; call  displaySector
 ; Display the first 4 bytes of the sector read
 ;  int 3
   ; AAA
-  mov   edx,offset buffer
-  mov   eax,dword ptr[edx]
-  mov   eax,0
-  call  displayDebugInfo2
-  ; Turning motor off
-;  outp (0x3F2, 0xC);
-  ;  int 3
-    mov ax,0ch
-    mov dx,3f2h
-    out dx,ax
-  ;  _dos_setvect (8+6, oldIRQ6);
-      ret
-  readSector  endp
+; mov   edx,offset buffer
+; mov   eax,11223344h
+; sub   eax,eax
+; mov   eax,dword ptr[edx]
+; call  displaySector
+; Turning motor off
+motorOff:
+   mov ax,0
+   mov dx,3f2h
+   out dx,ax
+   ret
+readSector  endp
+;Writes a byte to FDC
+;void fdc_out (unsigned char parm)
+fdc_out proc
+  mov   dx,3F4h
+loop_fdc_out:
 
-  getDiskParmTab proc
-    push  ds
-    push  es
-    push  esi
-    push  edi
-    push  ecx
-    push  eax
-    push  ebx
+  in    al,dx
+  test  al,80h      ;Is controller ready?
+  jz loop_fdc_out   ;   No, waiting...
 
-    mov   ax,ds
-    mov   es,ax
-    mov   ax,DSABS
-    mov   ds,ax
-    mov   esi,0f9c32h  ; Point to the diskette parameter table
-  ;  mov   eax,dword ptr [0f9c32h]   ; Get dpt data
-  ;  mov   eax,42424242h ; Get dpt data
-    mov   edi,offset dpt  ; address of diskette parameter table save area
-    mov   ecx,11    ; Prepare to copy 11 bytes
-    cld
-    rep   movsb   ; Save the diskette parameter table data
+  inc   dx
+  mov   al,ah    ;Writing the byte
+  out   dx,al
+  ret
+fdc_out endp
 
-    pop   ebx
-    pop   eax
-    pop   ecx
-    pop   edi
-    pop   esi
-    pop   es
-    pop   ds
-    ret
-  getDiskParmTab endp
+showit  proc
+  mov   ax,0b800h
+  mov   es,ax
+  sub   di,di
+  lea   si,workarea
+  mov   cx,100
+  cld
+  rep   movsw
+  mov   ecx,500000000
+toploop:
+  loop  toploop
+  ret
+showit  endp
 
-  ;Writes a byte to FDC
-  ;void fdc_out (unsigned char parm)
-  fdc_out proc
-    mov   dx,3F4h
-  loop_fdc_out:
+;Reads a byte from FDC
+;int fdc_inp (void)
+fdc_inp proc
+  mov   dx,3F4h
+loop_fdc_inp:
+  in    al,dx
+  test  al,80h      ;Is controller ready?
+  jz loop_fdc_inp   ;  No, waiting...
 
-    in    al,dx
-    test  al,80h      ;Is controller ready?
-    jz loop_fdc_out   ;   No, waiting...
+  inc   dx
+  in    al, dx      ;Reading a byte
+  ret
+fdc_inp endp
 
-    inc   dx
-    mov   al, ah    ;Writing the byte
-    out   dx, al
+; Waits for an interrupt generated by FDC
+;void int_wait (void) {
+int_wait  proc
+; _enable();
+; while (IRQ==0) {};
+  sti
+int_wait_loop:
+  cmp IRQ,0
+  je  int_wait_loop
+  mov IRQ,0
+  ret
+int_wait  endp
 
-    ret
-  fdc_out endp
+; This is the dma interrupt routine
+IRQ6  proc  far
+  mov IRQ,1
+  mov al,20h
+  out 20h,al
+  iret
+IRQ6  endp
 
-  ;Reads a byte from FDC
-  ;int fdc_inp (void)
-  fdc_inp proc
-    mov   dx,3F4h
-  loop_fdc_inp:
-    in    al,dx
-    test  al,80h      ;Is controller ready?
-    jz loop_fdc_inp   ;  No, waiting...
-
-    inc   dx
-    in    al, dx      ;Reading a byte
-    ret
-  fdc_inp endp
-
-  ; Waits for an interrupt generated by FDC
-  ;void int_wait (void) {
-  int_wait  proc
-    ;_enable();
-  ;  while (IRQ==0) {};
-  int_wait_loop:
-    cmp IRQ,0
-    je  int_wait_loop
-    mov IRQ,1
-    ret
-  int_wait  endp
-
-  ; DMA initialization routine
-  ;void dma_init (void far *buf)
-  dma_init  proc
-  ;  unsigned long f_adr;
-  ;  unsigned sg, of;
-  ;
-  ;  // Computing 24-bit address for the data buffer
-  ;  f_adr = ((unsigned long)FP_SEG(buf) << 4)
-  ;    + (unsigned long)FP_OFF(buf);
-  ;
-  ;  // Splitting the address into a page number
-  ;  // and an offset
-  ;  sg = (f_adr >> 16) & 0xff;
-;  of = f_adr & 0xffff;
-
-  ; Disabling ints during DMA programming
-  ;  _disable();    // Is this function call really necessary?
-  ; Computing 24-bit address for the data buffer
-  ; BBB
-  push  ds
-  push  ebx
-  push  ecx
+; DMA initialization routine
+; This function is for real mode only!!!!
+; It will cause this app to crash!!!
+dma_init  proc
+; Computing 24-bit address for the data buffer
   push  edx
-  push  esi
-  push  edi
-;  mov   ds,eax
-;  call  displayDebugInfo2
+  mov   eax,ds     ; Segment which contains the data buffer
+  shl   eax,4
+  add   eax,offset buffer
+  mov   edx,eax
 
-;  mov   sg,ax
-
-  mov   edx,offset buffer
-;  mov   of,ax
-;  shl   eax,4
-;  add   eax,offset buffer
-;  mov   edx,eax
-
-  mov   eax,DSABS  ;Segment which contains the data buffer
-;  shr   eax,16
-;  and   eax,0ffh
+  shr   eax,16
+  and   eax,0ffh
   mov   sg,ax
 
   and   edx,0ffffh
   mov   of,dx
-  mov   of,0
 
-  pop   edi
-  pop   esi
   pop   edx
-  pop   ecx
-  pop   ebx
-  pop   ds
   cli
 
   mov   al,46h      ;FDC read data command
@@ -1110,80 +1056,88 @@ dma_init  endp
 ; Timer frequency is 18.2 Hz
 ;void tdelay (int cnt)
 tdelay  proc
-;  push bx
-;  push dx
-;  push si
-
-;  mov si, ax
-;  mov ah, 0
-;  int 1ah
-;  mov bx, dx
-;  add bx, si
-  mov ecx,2194000000
-delay_loop:
-  loop  delay_loop
-;  int 1ah
-;  cmp dx, bx
-;  jne delay_loop
-
-;  pop si
-;  pop dx
-;  pop bx
-
-  ret
-
+      sti
+tloop:
+      cmp [timer],eax  
+      jc  tloop
+      cli
+      mov   ecx,1000000000
+tloop5:
+      loop  tloop5
+      ret
 tdelay  endp
+
+displaySector proc
+  ; Sample program to fill the screen with '!'
+  ;
+  push  es      ; Load the screen up with '!'
+  push  fs
+  push  cx
+  mov   bx,0b800h
+  mov   es,bx
+; mov   ax,1111h
+  lea   bx,workarea
+  call  htoa        ; Convert hex value in ax to ascii
+  sub   di,di
+  lea   si,workarea ;pt to work area where data to display is stored
+  mov cx,4   ;Setup to display 8 bytes (4 ascii characters)
+rep movsw
+  pop cx
+  pop fs
+  pop es
+  ret
+displaySector endp
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Converts binary value in ax 
 ; to ascii for display
 ; and returns the result in bx
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-htoa  proc
-  push  ebx
-  push  ecx
-  push  edx
-  mov ecx,4
-top:
-; Process the right nibble
-  xor dh,dh
-  mov dl,al
-  and dl,0fh
-  cmp dl,10
-  jl  notLetter
-  cmp dl,15
-  jg  exit  ; Invalid digit
-  add dl,7  ; Adjust for characters between A and F
-notLetter:
-  add dl,30h
-  push  dx
-; Process the left nibble
-  mov dl,al
-  shr dl,4
-  cmp dl,10
-  jl  notLetter2
-  cmp dl,15
-  jg  exit  ; Invalid digit
-  add dl,7  ; Adjust for A to F
-notLetter2:
-  add dl,30h
-  push  dx
-  shr eax,8 ;prepare to process the next byte
-loop  top
-  mov ecx,8
-top2:
-  pop dx
-  mov byte ptr[ebx],dl
-  mov byte ptr[ebx+1],0fh  ;high intensity attribute
-  inc ebx
-  inc ebx  ;skip char and attribute
-  loop  top2
-exit:
-  pop edx
-  pop ecx
-  pop ebx
-  ret
-htoa  endp
+ htoa  proc
+   push  ebx
+   push  ecx
+   push  edx
+   mov ecx,4
+ top:
+ ; Process the right nibble
+   xor dh,dh
+   mov dl,al
+   and dl,0fh
+   cmp dl,10
+   jl  notLetter
+   cmp dl,15
+   jg  exit  ; Invalid digit
+   add dl,7  ; Adjust for characters between A and F
+ notLetter:
+   add dl,30h
+   push  dx
+ ; Process the left nibble
+   mov dl,al
+   shr dl,4
+   cmp dl,10
+   jl  notLetter2
+   cmp dl,15
+   jg  exit  ; Invalid digit
+   add dl,7  ; Adjust for A to F
+ notLetter2:
+   add dl,30h
+   push  dx
+   shr eax,8 ;prepare to process the next byte
+ loop  top
+   mov ecx,8
+ top2:
+   pop dx
+   mov byte ptr[ebx],dl
+   mov byte ptr[ebx+1],0fh  ;high intensity attribute
+   inc ebx
+   inc ebx  ;skip char and attribute
+   loop  top2
+ exit:
+   pop edx
+   pop ecx
+   pop ebx
+   ret
+ htoa  endp
 
 seg386  ends
     end bootstrap
